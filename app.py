@@ -1,15 +1,15 @@
-# ──────────────────────────────────────────────────────────────
-#  📊  DASHBOARD FINANCIERO AVANZADO
-#      ROIC / EVA estilo GuruFocus + manejo robusto de errores
-# ──────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
+# DASHBOARD FINANCIERO AVANZADO
+# -------------------------------------------------------------
 import streamlit as st
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 import time
+from datetime import datetime, timedelta
 
 # -------------------------------------------------------------
-# ⚙️ Configuración global
+# ⚙️ Configuración global de la página
 # -------------------------------------------------------------
 st.set_page_config(
     page_title="📊 Dashboard Financiero Avanzado",
@@ -18,317 +18,442 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Parámetros por defecto (editables)
-Rf, Rm, Tc = 0.0435, 0.085, 0.21
+# -------------------------------------------------------------
+# Parámetros WACC por defecto (ajustables en el sidebar)
+# -------------------------------------------------------------
+Rf = 0.0435  # Tasa libre de riesgo
+Rm = 0.085   # Retorno esperado del mercado
+Tc = 0.21    # Tasa impositiva corporativa
 
 # -------------------------------------------------------------
-# ░░░░░  Funciones auxiliares
+# Funciones auxiliares
 # -------------------------------------------------------------
 def safe_first(obj):
+    """Devuelve el primer valor no nulo de una serie; None si no hay."""
     if obj is None:
         return None
-    if hasattr(obj, "dropna"):
-        obj = obj.dropna()
-        return obj.iloc[0] if not obj.empty else None
-    return obj
+    if hasattr(obj, "dropna") and hasattr(obj, "iloc"):
+        serie = obj.dropna()
+        return serie.iloc[0] if not serie.empty else None
+    return obj  # ya es escalar
 
-def get_cash_equiv(bs, info):
-    keys = ["Cash And Cash Equivalents",
-            "Cash And Cash Equivalents At Carrying Value",
-            "Cash Cash Equivalents And Short Term Investments"]
-    for k in keys:
-        if k in bs.index:
-            return bs.loc[k]
-    return pd.Series([info.get("totalCash")], index=bs.columns[:1])
+def calcular_wacc(info, balance_sheet):
+    """Devuelve WACC y deuda total."""
+    try:
+        beta = info.get("beta", 1.0)
+        price = info.get("currentPrice")
+        shares = info.get("sharesOutstanding")
+        market_cap = price * shares if price and shares else None
 
-def get_ebit(tkr):
-    for k in ["EBIT", "Operating Income", "Earnings Before Interest and Taxes"]:
-        if k in tkr.financials.index:
-            return tkr.financials.loc[k]
-        if k in tkr.income_stmt.index:
-            return tkr.income_stmt.loc[k]
-    return pd.Series([tkr.info.get("ebit")], index=tkr.financials.columns[:1])
+        lt_debt = safe_first(balance_sheet.loc["Long Term Debt"]) if "Long Term Debt" in balance_sheet.index else None
+        st_debt = safe_first(balance_sheet.loc["Short Term Debt"]) if "Short Term Debt" in balance_sheet.index else None
+        total_debt = (lt_debt or 0) + (st_debt or 0)
 
-def invested_cap_avg(debt, equity, cash_eq):
-    ic0 = (debt.iloc[0] or 0)+(equity.iloc[0] or 0)-(cash_eq.iloc[0] or 0)
-    ic1 = (debt.iloc[1] or 0)+(equity.iloc[1] or 0)-(cash_eq.iloc[1] or 0) if len(debt) > 1 else ic0
-    return (ic0 + ic1) / 2 or None
+        if total_debt == 0:
+            total_debt = info.get("totalDebt") or 0
 
-def wacc(info, total_debt, Tc):
-    beta  = info.get("beta", 1.0)
-    price = info.get("currentPrice")
-    shares = info.get("sharesOutstanding")
-    mcap = price * shares if price and shares else 0
-    Re, Rd = Rf + beta*(Rm-Rf), 0.055 if total_debt else 0
-    if mcap + total_debt == 0:
+        Re = Rf + beta * (Rm - Rf)                 # Coste del equity
+        Rd = 0.055 if total_debt else 0            # Coste de la deuda (aprox.)
+
+        E = market_cap or 0
+        D = total_debt
+
+        if E + D == 0:
+            return None, total_debt
+
+        wacc = (E / (E + D)) * Re + (D / (E + D)) * Rd * (1 - Tc)
+        return wacc, total_debt
+    except Exception:
+        return None, None
+
+def calcular_crecimiento_historico(financials, metric):
+    """CAGR a 4 periodos si hay datos suficientes."""
+    try:
+        if metric not in financials.index:
+            return None
+        datos = financials.loc[metric].dropna().iloc[:4]
+        if len(datos) < 2:
+            return None
+        primer_valor = datos.iloc[-1]
+        ultimo_valor = datos.iloc[0]
+        años = len(datos) - 1
+        if primer_valor == 0:
+            return None
+        return (ultimo_valor / primer_valor) ** (1 / años) - 1
+    except:
         return None
-    return (mcap/(mcap+total_debt))*Re + (total_debt/(mcap+total_debt))*Rd*(1-Tc)
 
-def calc_cagr(df, metric):
-    if metric not in df.index:
-        return None
-    vals = df.loc[metric].dropna().iloc[:4]
-    if len(vals) < 2 or vals.iloc[-1] == 0:
-        return None
-    return (vals.iloc[0] / vals.iloc[-1]) ** (1/(len(vals)-1)) - 1
+def extraer_ebit(stock):
+    """Busca EBIT en distintos lugares (financials, income_stmt, info)."""
+    posibles = [
+        "EBIT", "Ebit",
+        "Operating Income",
+        "Earnings Before Interest and Taxes"
+    ]
+    fin = stock.financials
+    for key in posibles:
+        if key in fin.index:
+            return safe_first(fin.loc[key])
 
-def calc_roic_eva(tkr, info, bs, Tc):
-    ebit   = get_ebit(tkr)
-    debt   = bs.loc["Total Debt"] if "Total Debt" in bs.index else \
-             (bs.loc.get("Long Term Debt", 0) + bs.loc.get("Short Term Debt", 0))
-    equity = bs.loc["Total Stockholder Equity"] if "Total Stockholder Equity" in bs.index else \
-             pd.Series([info.get("totalStockholderEquity")], index=bs.columns[:1])
-    cash_eq = get_cash_equiv(bs, info)
-    inv_cap = invested_cap_avg(debt, equity, cash_eq)
-    nopat = safe_first(ebit)
-    if nopat is not None:
-        nopat *= (1 - Tc)
-    roic = nopat / inv_cap if (nopat is not None and inv_cap) else None
-    wacc_val = wacc(info, safe_first(debt) or info.get("totalDebt") or 0, Tc)
-    eva = (roic - wacc_val) * inv_cap if all(v is not None for v in (roic, wacc_val, inv_cap)) else None
-    return roic, eva, wacc_val
+    # Income statement (algunas veces está allí)
+    inc = stock.income_stmt
+    for key in posibles:
+        if key in inc.index:
+            return safe_first(inc.loc[key])
+
+    # Campo directo en .info como último recurso
+    return stock.info.get("ebit")
 
 # -------------------------------------------------------------
-# ░░░░░  Descarga y procesa un ticker (con reintento)
+# Obtención de datos de cada empresa
 # -------------------------------------------------------------
-def fetch_ticker(tkr, Tc, retries=2):
-    for attempt in range(retries):
-        try:
-            stk  = yf.Ticker(tkr, threads=False)
-            info = stk.info
-            bs   = stk.balance_sheet
-            if not info or bs.empty:
-                raise ValueError("info o balance_sheet vacío")
-            fin  = stk.financials
-            cf   = stk.cashflow
+def obtener_datos_financieros(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        bs   = stock.balance_sheet
+        fin  = stock.financials
+        cf   = stock.cashflow
 
-            roic, eva, wacc_val = calc_roic_eva(stk, info, bs, Tc)
+        # ---- Cálculos principales ----------------------------------------
+        ebit = extraer_ebit(stock)
 
-            fcf = cf.loc["Free Cash Flow"].iloc[0] if "Free Cash Flow" in cf.index else None
-            shr = info.get("sharesOutstanding")
-            pfcf = info.get("currentPrice") / (fcf/shr) if (fcf and shr) else None
+        lt_debt = safe_first(bs.loc["Long Term Debt"]) if "Long Term Debt" in bs.index else None
+        st_debt = safe_first(bs.loc["Short Term Debt"]) if "Short Term Debt" in bs.index else None
+        total_debt = (lt_debt or 0) + (st_debt or 0)
+        if total_debt == 0:
+            total_debt = info.get("totalDebt") or 0
 
-            return {
-                "Ticker": tkr,
-                "Sector": info.get("sector"),
-                "Precio": info.get("currentPrice"),
-                "P/E": info.get("trailingPE"),
-                "P/B": info.get("priceToBook"),
-                "P/FCF": pfcf,
-                "Dividend Yield %": info.get("dividendYield"),
-                "Payout Ratio": info.get("payoutRatio"),
-                "ROA": info.get("returnOnAssets"),
-                "ROE": info.get("returnOnEquity"),
-                "Current Ratio": info.get("currentRatio"),
-                "Quick Ratio": info.get("quickRatio"),
-                "Debt/Eq": info.get("debtToEquity"),
-                "LtDebt/Eq": info.get("longTermDebtToEquity"),
-                "Oper Margin": info.get("operatingMargins"),
-                "Profit Margin": info.get("profitMargins"),
-                "WACC": wacc_val,
-                "ROIC": roic,
-                "EVA": eva,
-                "Revenue Growth": calc_cagr(fin, "Total Revenue"),
-                "EPS Growth":     calc_cagr(fin, "Net Income"),
-                "FCF Growth":     calc_cagr(cf, "Free Cash Flow") or calc_cagr(cf, "Operating Cash Flow"),
-            }
-        except Exception as e:
-            if attempt == retries - 1:
-                return {"Ticker": tkr, "Error": str(e)}
-            time.sleep(2)
+        equity = safe_first(bs.loc["Total Stockholder Equity"]) if "Total Stockholder Equity" in bs.index else None
+        if equity in (None, 0):
+            equity = info.get("totalStockholderEquity") or 0
+
+        wacc, _ = calcular_wacc(info, bs)
+
+        capital_invertido = (total_debt or 0) + (equity or 0)
+        roic = (
+            (ebit * (1 - Tc) / capital_invertido)
+            if (ebit is not None) and capital_invertido
+            else None
+        )
+        eva = (
+            (roic - wacc) * capital_invertido
+            if (roic is not None) and (wacc is not None) and capital_invertido
+            else None
+        )
+
+        # ---- Otros datos --------------------------------------------------
+        price = info.get("currentPrice")
+        name = info.get("longName", ticker)
+        sector   = info.get("sector", "N/D")
+        country  = info.get("country", "N/D")
+        industry = info.get("industry", "N/D")
+
+        pe = info.get("trailingPE")
+        pb = info.get("priceToBook")
+        dividend = info.get("dividendRate")
+        dividend_yield = info.get("dividendYield")
+        payout = info.get("payoutRatio")
+
+        roa = info.get("returnOnAssets")
+        roe = info.get("returnOnEquity")
+
+        current_ratio = info.get("currentRatio")
+        quick_ratio   = info.get("quickRatio")
+
+        ltde = info.get("longTermDebtToEquity")
+        de   = info.get("debtToEquity")
+
+        op_margin     = info.get("operatingMargins")
+        profit_margin = info.get("profitMargins")
+
+        fcf = cf.loc["Free Cash Flow"].iloc[0] if "Free Cash Flow" in cf.index else None
+        shares = info.get("sharesOutstanding")
+        pfcf = price / (fcf / shares) if (fcf and shares) else None
+
+        revenue_growth = calcular_crecimiento_historico(fin, "Total Revenue")
+        eps_growth     = calcular_crecimiento_historico(fin, "Net Income")
+        fcf_growth     = calcular_crecimiento_historico(cf, "Free Cash Flow") \
+            or calcular_crecimiento_historico(cf, "Operating Cash Flow")
+
+        cash_ratio = info.get("cashRatio")
+        ocf = cf.loc["Operating Cash Flow"].iloc[0] if "Operating Cash Flow" in cf.index else None
+        current_liab = bs.loc["Total Current Liabilities"].iloc[0] if "Total Current Liabilities" in bs.index else None
+        cash_flow_ratio = (ocf / current_liab) if (ocf and current_liab) else None
+
+        return {
+            "Ticker": ticker,
+            "Nombre": name,
+            "Sector": sector,
+            "País": country,
+            "Industria": industry,
+            "Precio": price,
+            "P/E": pe,
+            "P/B": pb,
+            "P/FCF": pfcf,
+            "Dividend Year": dividend,
+            "Dividend Yield %": dividend_yield,
+            "Payout Ratio": payout,
+            "ROA": roa,
+            "ROE": roe,
+            "Current Ratio": current_ratio,
+            "Quick Ratio": quick_ratio,
+            "LtDebt/Eq": ltde,
+            "Debt/Eq": de,
+            "Oper Margin": op_margin,
+            "Profit Margin": profit_margin,
+            "WACC": wacc,
+            "ROIC": roic,
+            "EVA": eva,
+            "Deuda Total": total_debt,
+            "Patrimonio Neto": equity,
+            "Revenue Growth": revenue_growth,
+            "EPS Growth": eps_growth,
+            "FCF Growth": fcf_growth,
+            "Cash Ratio": cash_ratio,
+            "Cash Flow Ratio": cash_flow_ratio,
+            "Operating Cash Flow": ocf,
+            "Current Liabilities": current_liab,
+        }
+    except Exception as e:
+        return {"Ticker": ticker, "Error": str(e)}
 
 # -------------------------------------------------------------
-# ░░░░░  Streamlit UI
+# INTERFAZ PRINCIPAL
 # -------------------------------------------------------------
 def main():
-    st.title("📊 Dashboard Financiero Avanzado")
+    st.title("📊 Dashboard de Análisis Financiero Avanzado")
 
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Configuración")
-        tickers_in = st.text_area("Tickers (separados por coma)", "HRL, AAPL, MSFT, GOOGL")
-        max_t = st.slider("Máx tickers", 1, 100, 50)
+        tickers_input = st.text_area(
+            "🔎 Ingresa tickers (separados por coma)",
+            "AAPL, MSFT, GOOGL, AMZN, TSLA",
+            help="Ejemplo: AAPL, MSFT, GOOG"
+        )
+        max_tickers = st.slider("Número máximo de tickers", 1, 100, 50)
+
         st.markdown("---")
+        st.markdown("**Parámetros WACC**")
         global Rf, Rm, Tc
-        Rf = st.number_input("Risk-free rate (%)", 0.0, 20.0, 4.35) / 100
-        Rm = st.number_input("Market return (%)", 0.0, 30.0, 8.5) / 100
-        Tc = st.number_input("Tax rate (%)", 0.0, 50.0, 21.0) / 100
+        Rf = st.number_input("Tasa libre de riesgo (%)", 0.0, 20.0, 4.35) / 100
+        Rm = st.number_input("Retorno esperado del mercado (%)", 0.0, 30.0, 8.5) / 100
+        Tc = st.number_input("Tasa impositiva corporativa (%)", 0.0, 50.0, 21.0) / 100
 
-    tickers = [t.strip().upper() for t in tickers_in.split(",") if t.strip()][:max_t]
+    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()][:max_tickers]
 
-    if st.button("🔍 Analizar", type="primary"):
+    if st.button("🔍 Analizar Acciones", type="primary"):
         if not tickers:
-            st.warning("Ingresa al menos un ticker");  return
-
-        results, pb = {}, st.progress(0)
-        for i, tk in enumerate(tickers, 1):
-            results[tk] = fetch_ticker(tk, Tc)
-            pb.progress(i / len(tickers))
-        pb.empty()
-
-        df_ok  = pd.DataFrame([v for v in results.values() if "Error" not in v])
-        df_err = pd.DataFrame([v for v in results.values() if "Error" in v])
-
-        if df_ok.empty:
-            st.error("No se obtuvo información válida para ningún ticker.")
-            if not df_err.empty:
-                st.subheader("🚫 Errores")
-                st.table(df_err)
+            st.warning("Por favor ingresa al menos un ticker")
             return
 
-        # Formateo de %
-        pct_cols = ["Dividend Yield %", "Payout Ratio", "ROA", "ROE",
-                    "Oper Margin", "Profit Margin", "WACC", "ROIC"]
-        for c in pct_cols:
-            if c in df_ok.columns:
-                df_ok[c] = df_ok[c].apply(lambda x: f"{x*100:,.2f}%" if pd.notnull(x) else "N/D")
+        resultados = {}
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        batch_size = 10
+        for batch_start in range(0, len(tickers), batch_size):
+            batch_tickers = tickers[batch_start:batch_start+batch_size]
+            for i, t in enumerate(batch_tickers):
+                status_text.text(f"⏳ Procesando {t} ({batch_start + i + 1}/{len(tickers)})…")
+                resultados[t] = obtener_datos_financieros(t)
+                progress_bar.progress((batch_start + i + 1) / len(tickers))
+                time.sleep(1)  # evitar rate-limit
+
+        status_text.text("✅ Análisis completado!")
+        time.sleep(0.5)
+        status_text.empty()
+        progress_bar.empty()
+
+        # ---- DataFrame final ---------------------------------------------
+        datos = [d for d in resultados.values() if "Error" not in d]
+        if not datos:
+            st.error("No se pudo obtener datos válidos para ningún ticker")
+            return
+
+        df = pd.DataFrame(datos)
 
         # -----------------------------------------------------
-        # 1. Resumen General
+        # Sección 1 - Resumen General
         # -----------------------------------------------------
         st.header("📋 Resumen General")
-        cols = ["Ticker", "Sector", "Precio", "P/E", "P/B", "P/FCF",
-                "Dividend Yield %", "Payout Ratio", "ROA", "ROE",
-                "Current Ratio", "Debt/Eq", "Oper Margin", "Profit Margin",
-                "WACC", "ROIC", "EVA"]
-        st.dataframe(df_ok[cols].dropna(how="all", axis=1),
-                     use_container_width=True, height=380)
 
-        if not df_err.empty:
-            st.subheader("🚫 Tickers con error")
-            st.table(df_err)
+        porcentajes = [
+            "Dividend Yield %", "Payout Ratio", "ROA", "ROE",
+            "Oper Margin", "Profit Margin", "WACC", "ROIC", "EVA"
+        ]
+        for col in porcentajes:
+            if col in df.columns:
+                df[col] = df[col].apply(lambda x: f"{x:.2%}" if pd.notnull(x) else "N/D")
+
+        columnas_mostrar = [
+            "Ticker", "Nombre", "Sector", "Precio", "P/E", "P/B", "P/FCF",
+            "Dividend Yield %", "Payout Ratio", "ROA", "ROE", "Current Ratio",
+            "Debt/Eq", "Oper Margin", "Profit Margin", "WACC", "ROIC", "EVA"
+        ]
+        st.dataframe(
+            df[columnas_mostrar].dropna(how="all", axis=1),
+            use_container_width=True,
+            height=400
+        )
 
         # -----------------------------------------------------
-        # 2. Análisis de Valoración
+        # Sección 2 - Análisis de Valoración
         # -----------------------------------------------------
         st.header("💰 Análisis de Valoración")
         col1, col2 = st.columns(2)
 
         with col1:
             st.subheader("Ratios de Valoración")
-            fig, ax = plt.subplots(figsize=(9, 4))
-            df_ok[["Ticker", "P/E", "P/B", "P/FCF"]].set_index("Ticker")\
-                 .apply(pd.to_numeric, errors="coerce").plot(kind="bar", ax=ax, rot=45)
+            fig, ax = plt.subplots(figsize=(10, 4))
+            df_plot = df[["Ticker", "P/E", "P/B", "P/FCF"]].set_index("Ticker").apply(pd.to_numeric, errors="coerce")
+            df_plot.plot(kind="bar", ax=ax, rot=45)
+            ax.set_title("Comparativa de Ratios de Valoración")
             ax.set_ylabel("Ratio")
-            st.pyplot(fig); plt.close()
+            st.pyplot(fig)
+            plt.close()
 
         with col2:
-            st.subheader("Dividend Yield (%)")
-            fig, ax = plt.subplots(figsize=(9, 4))
-            dy = df_ok[["Ticker", "Dividend Yield %"]].replace("N/D", 0)
-            dy["Dividend Yield %"] = dy["Dividend Yield %"].str.rstrip("%").astype(float)
-            dy.set_index("Ticker").plot(kind="bar", ax=ax, rot=45)
-            ax.set_ylabel("%")
-            st.pyplot(fig); plt.close()
+            st.subheader("Dividendos")
+            fig, ax = plt.subplots(figsize=(10, 4))
+            df_plot = df[["Ticker", "Dividend Yield %"]].set_index("Ticker")
+            df_plot["Dividend Yield %"] = df_plot["Dividend Yield %"].replace("N/D", 0)
+            df_plot["Dividend Yield %"] = df_plot["Dividend Yield %"].str.rstrip("%").astype("float")
+            df_plot.plot(kind="bar", ax=ax, rot=45)
+            ax.set_title("Rendimiento de Dividendos (%)")
+            ax.set_ylabel("Dividend Yield %")
+            st.pyplot(fig)
+            plt.close()
 
         # -----------------------------------------------------
-        # 3. Rentabilidad y Eficiencia
+        # Sección 3 - Rentabilidad y Eficiencia
         # -----------------------------------------------------
         st.header("📈 Rentabilidad y Eficiencia")
         tabs = st.tabs(["ROE vs ROA", "Márgenes", "WACC vs ROIC"])
 
         with tabs[0]:
             fig, ax = plt.subplots(figsize=(10, 5))
-            rr = df_ok[["Ticker", "ROE", "ROA"]].replace("N/D", 0)
-            rr["ROE"] = rr["ROE"].str.rstrip("%").astype(float)
-            rr["ROA"] = rr["ROA"].str.rstrip("%").astype(float)
-            rr.set_index("Ticker").plot(kind="bar", ax=ax, rot=45)
-            ax.set_ylabel("%")
-            st.pyplot(fig); plt.close()
+            df_plot = df[["Ticker", "ROE", "ROA"]].set_index("Ticker")
+            df_plot["ROE"] = df_plot["ROE"].str.rstrip("%").astype("float")
+            df_plot["ROA"] = df_plot["ROA"].str.rstrip("%").astype("float")
+            df_plot.plot(kind="bar", ax=ax, rot=45)
+            ax.set_title("ROE vs ROA (%)")
+            ax.set_ylabel("Porcentaje")
+            st.pyplot(fig)
+            plt.close()
 
         with tabs[1]:
             fig, ax = plt.subplots(figsize=(10, 5))
-            mm = df_ok[["Ticker", "Oper Margin", "Profit Margin"]].replace("N/D", 0)
-            mm["Oper Margin"] = mm["Oper Margin"].str.rstrip("%").astype(float)
-            mm["Profit Margin"] = mm["Profit Margin"].str.rstrip("%").astype(float)
-            mm.set_index("Ticker").plot(kind="bar", ax=ax, rot=45)
-            ax.set_ylabel("%")
-            st.pyplot(fig); plt.close()
+            df_plot = df[["Ticker", "Oper Margin", "Profit Margin"]].set_index("Ticker")
+            df_plot["Oper Margin"] = df_plot["Oper Margin"].str.rstrip("%").astype("float")
+            df_plot["Profit Margin"] = df_plot["Profit Margin"].str.rstrip("%").astype("float")
+            df_plot.plot(kind="bar", ax=ax, rot=45)
+            ax.set_title("Margen Operativo vs Margen Neto (%)")
+            ax.set_ylabel("Porcentaje")
+            st.pyplot(fig)
+            plt.close()
 
         with tabs[2]:
             fig, ax = plt.subplots(figsize=(10, 5))
-            for _, r in df_ok.iterrows():
-                w = float(r["WACC"].rstrip("%")) if r["WACC"] != "N/D" else None
-                rt = float(r["ROIC"].rstrip("%")) if r["ROIC"] != "N/D" else None
-                if w is not None and rt is not None:
-                    ax.bar(r["Ticker"], rt, color="green" if rt > w else "red", alpha=0.6)
-                    ax.bar(r["Ticker"], w, color="gray", alpha=0.3)
-            ax.set_ylabel("%")
-            ax.set_title("Creación de Valor (ROIC vs WACC)")
-            st.pyplot(fig); plt.close()
+            for _, row in df.iterrows():
+                wacc_val = float(row["WACC"].rstrip("%")) if row["WACC"] != "N/D" else None
+                roic_val = float(row["ROIC"].rstrip("%")) if row["ROIC"] != "N/D" else None
+                if wacc_val is not None and roic_val is not None:
+                    color = "green" if roic_val > wacc_val else "red"
+                    ax.bar(row["Ticker"], roic_val, color=color, alpha=0.6, label="ROIC")
+                    ax.bar(row["Ticker"], wacc_val, color="gray", alpha=0.3, label="WACC")
+            ax.set_title("Creación de Valor: ROIC vs WACC (%)")
+            ax.set_ylabel("Porcentaje")
+            ax.legend()
+            st.pyplot(fig)
+            plt.close()
 
         # -----------------------------------------------------
-        # 4. Deuda y Liquidez
+        # Sección 4 - Análisis de Deuda
         # -----------------------------------------------------
-        st.header("🏦 Deuda & Liquidez")
-        c3, c4 = st.columns(2)
+        st.header("🏦 Estructura de Capital y Deuda")
+        col1, col2 = st.columns(2)
 
-        with c3:
+        with col1:
             st.subheader("Apalancamiento")
-            fig, ax = plt.subplots(figsize=(9, 4))
-            df_ok[["Ticker", "Debt/Eq", "LtDebt/Eq"]].set_index("Ticker")\
-                 .apply(pd.to_numeric, errors="coerce").plot(kind="bar", stacked=True, ax=ax, rot=45)
+            fig, ax = plt.subplots(figsize=(10, 5))
+            df_plot = df[["Ticker", "Debt/Eq", "LtDebt/Eq"]].set_index("Ticker").apply(pd.to_numeric, errors="coerce")
+            df_plot.plot(kind="bar", stacked=True, ax=ax, rot=45)
             ax.axhline(1, color="red", linestyle="--")
-            st.pyplot(fig); plt.close()
+            ax.set_title("Deuda/Patrimonio")
+            ax.set_ylabel("Ratio")
+            st.pyplot(fig)
+            plt.close()
 
-        with c4:
+        with col2:
             st.subheader("Liquidez")
-            fig, ax = plt.subplots(figsize=(9, 4))
-            df_ok[["Ticker", "Current Ratio", "Quick Ratio"]]\
-                 .set_index("Ticker").apply(pd.to_numeric, errors="coerce")\
-                 .plot(kind="bar", ax=ax, rot=45)
+            fig, ax = plt.subplots(figsize=(10, 5))
+            df_plot = df[["Ticker", "Current Ratio", "Quick Ratio", "Cash Ratio"]].set_index("Ticker").apply(pd.to_numeric, errors="coerce")
+            df_plot.plot(kind="bar", ax=ax, rot=45)
             ax.axhline(1, color="green", linestyle="--")
-            st.pyplot(fig); plt.close()
+            ax.set_title("Ratios de Liquidez")
+            ax.set_ylabel("Ratio")
+            st.pyplot(fig)
+            plt.close()
 
         # -----------------------------------------------------
-        # 5. Crecimiento
+        # Sección 5 - Crecimiento
         # -----------------------------------------------------
-        st.header("🚀 Crecimiento (CAGR 3-4 años)")
-        growth = df_ok.set_index("Ticker")[["Revenue Growth", "EPS Growth", "FCF Growth"]] * 100
+        st.header("🚀 Crecimiento Histórico")
+        growth_metrics = ["Revenue Growth", "EPS Growth", "FCF Growth"]
+        df_growth = df[["Ticker"] + growth_metrics].set_index("Ticker") * 100  # a %
         fig, ax = plt.subplots(figsize=(12, 6))
-        growth.plot(kind="bar", ax=ax, rot=45)
+        df_growth.plot(kind="bar", ax=ax, rot=45)
         ax.axhline(0, color="black", linewidth=0.8)
-        ax.set_ylabel("%")
-        st.pyplot(fig); plt.close()
+        ax.set_title("Tasas de Crecimiento Anual (%)")
+        ax.set_ylabel("Crecimiento %")
+        st.pyplot(fig)
+        plt.close()
 
         # -----------------------------------------------------
-        # 6. Análisis Individual
+        # Sección 6 - Análisis Individual
         # -----------------------------------------------------
-        st.header("🔍 Análisis Individual")
-        pick = st.selectbox("Selecciona empresa", df_ok["Ticker"].unique())
-        det = df_ok[df_ok["Ticker"] == pick].iloc[0]
+        st.header("🔍 Análisis por Empresa")
+        selected_ticker = st.selectbox("Selecciona una empresa", df["Ticker"].unique())
+        empresa = df[df["Ticker"] == selected_ticker].iloc[0]
 
-        cA, cB, cC = st.columns(3)
-        with cA:
-            st.metric("Precio", f"${det['Precio']:,.2f}" if det['Precio'] else "N/D")
-            st.metric("P/E", det["P/E"])
-            st.metric("P/B", det["P/B"])
-        with cB:
-            st.metric("ROIC", det["ROIC"])
-            st.metric("WACC", det["WACC"])
-            st.metric("EVA", f"{det['EVA']:,.0f}" if pd.notnull(det['EVA']) else "N/D")
-        with cC:
-            st.metric("ROE", det["ROE"])
-            st.metric("Dividend Yield", det["Dividend Yield %"])
-            st.metric("Debt/Eq", det["Debt/Eq"])
+        st.subheader(f"Análisis Detallado: {empresa['Nombre']}")
 
-        st.subheader("ROIC vs WACC")
-        if det["ROIC"] != "N/D" and det["WACC"] != "N/D":
-            rv = float(det["ROIC"].rstrip("%"))
-            wv = float(det["WACC"].rstrip("%"))
-            fig, ax = plt.subplots(figsize=(4, 3))
-            ax.bar(["ROIC", "WACC"], [rv, wv], color=["green" if rv > wv else "red", "gray"])
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Precio", f"${empresa['Precio']:,.2f}" if empresa['Precio'] else "N/D")
+            st.metric("P/E", empresa['P/E'])
+            st.metric("P/B", empresa['P/B'])
+        with col2:
+            st.metric("ROE", empresa['ROE'])
+            st.metric("ROIC", empresa['ROIC'])
+            st.metric("WACC", empresa['WACC'])
+        with col3:
+            st.metric("Deuda/Patrimonio", empresa['Debt/Eq'])
+            st.metric("Margen Neto", empresa['Profit Margin'])
+            st.metric("Dividend Yield", empresa['Dividend Yield %'])
+
+        st.subheader("Creación de Valor")
+        fig, ax = plt.subplots(figsize=(6, 4))
+        if empresa['ROIC'] != "N/D" and empresa['WACC'] != "N/D":
+            roic_val = float(empresa['ROIC'].rstrip("%"))
+            wacc_val = float(empresa['WACC'].rstrip("%"))
+            color = "green" if roic_val > wacc_val else "red"
+            ax.bar(["ROIC", "WACC"], [roic_val, wacc_val], color=[color, "gray"])
+            ax.set_title("Creación de Valor (ROIC vs WACC)")
             ax.set_ylabel("%")
             st.pyplot(fig)
-            if rv > wv:
-                st.success("✅ Crea valor (ROIC > WACC)")
+            plt.close()
+            if roic_val > wacc_val:
+                st.success("✅ La empresa está creando valor (ROIC > WACC)")
             else:
-                st.error("❌ Destruye valor (ROIC < WACC)")
+                st.error("❌ La empresa está destruyendo valor (ROIC < WACC)")
         else:
-            st.info("Datos insuficientes para comparar ROIC/WACC")
+            st.warning("Datos insuficientes para análisis ROIC/WACC")
 
 # -------------------------------------------------------------
-# 🏁 Ejecución
+# Punto de entrada
 # -------------------------------------------------------------
 if __name__ == "__main__":
     main()
