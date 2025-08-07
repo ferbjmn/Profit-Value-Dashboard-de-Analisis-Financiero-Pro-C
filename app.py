@@ -177,7 +177,7 @@ def obtener_datos_financieros(ticker):
         return {"Ticker": ticker, "Error": str(e)}
 
 # -------------------------------------------------------------
-# INTERFAZ PRINCIPAL
+# ░░░░░   INTERFAZ STREAMLIT
 # -------------------------------------------------------------
 def main():
     st.title("📊 Dashboard de Análisis Financiero Avanzado")
@@ -185,76 +185,48 @@ def main():
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Configuración")
-        tickers_input = st.text_area(
-            "🔎 Ingresa tickers (separados por coma)",
-            "AAPL, MSFT, GOOGL, AMZN, TSLA",
-            help="Ejemplo: AAPL, MSFT, GOOG"
-        )
-        max_tickers = st.slider("Número máximo de tickers", 1, 100, 50)
-
+        tickers_in = st.text_area("🔎 Tickers (coma)", "HRL, AAPL, MSFT")
+        max_t = st.slider("Máx tickers", 1, 100, 50)
         st.markdown("---")
-        st.markdown("**Parámetros WACC**")
         global Rf, Rm, Tc
-        Rf = st.number_input("Tasa libre de riesgo (%)", 0.0, 20.0, 4.35) / 100
-        Rm = st.number_input("Retorno esperado del mercado (%)", 0.0, 30.0, 8.5) / 100
-        Tc = st.number_input("Tasa impositiva corporativa (%)", 0.0, 50.0, 21.0) / 100
+        Rf = st.number_input("Risk-free (%)", 0.0, 20.0, 4.35) / 100
+        Rm = st.number_input("Retorno mercado (%)", 0.0, 30.0, 8.5) / 100
+        Tc = st.number_input("Tax rate (%)", 0.0, 50.0, 21.0) / 100
 
-    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()][:max_tickers]
+    tickers = [t.strip().upper() for t in tickers_in.split(",") if t.strip()][:max_t]
 
-    if st.button("🔍 Analizar Acciones", type="primary"):
+    if st.button("🔍 Analizar", type="primary"):
         if not tickers:
-            st.warning("Por favor ingresa al menos un ticker")
+            st.warning("Ingresa al menos un ticker")
             return
 
-        resultados = {}
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        res, pb = {}, st.progress(0)
+        for i, t in enumerate(tickers, 1):
+            res[t] = obtener_datos_financieros(t)
+            pb.progress(i / len(tickers))
+            time.sleep(1)
+        pb.empty()
 
-        batch_size = 10
-        for batch_start in range(0, len(tickers), batch_size):
-            batch_tickers = tickers[batch_start:batch_start+batch_size]
-            for i, t in enumerate(batch_tickers):
-                status_text.text(f"⏳ Procesando {t} ({batch_start + i + 1}/{len(tickers)})…")
-                resultados[t] = obtener_datos_financieros(t)
-                progress_bar.progress((batch_start + i + 1) / len(tickers))
-                time.sleep(1)  # evitar rate-limit
-
-        status_text.text("✅ Análisis completado!")
-        time.sleep(0.5)
-        status_text.empty()
-        progress_bar.empty()
-
-        # ---- DataFrame final ---------------------------------------------
-        datos = [d for d in resultados.values() if "Error" not in d]
-        if not datos:
-            st.error("No se pudo obtener datos válidos para ningún ticker")
+        df = pd.DataFrame([d for d in res.values() if "Error" not in d])
+        if df.empty:
+            st.error("Sin datos válidos")
             return
 
-        df = pd.DataFrame(datos)
+        # ----- formateo porcentual -----
+        pct_cols = ["Dividend Yield %", "Payout Ratio", "ROA", "ROE",
+                    "Oper Margin", "Profit Margin", "WACC", "ROIC"]
+        for c in pct_cols:
+            if c in df.columns:
+                df[c] = df[c].apply(lambda x: f"{x*100:,.2f}%" if pd.notnull(x) else "N/D")
 
-        # -----------------------------------------------------
-        # Sección 1 - Resumen General
-        # -----------------------------------------------------
+        # =========================================================
         st.header("📋 Resumen General")
-
-        porcentajes = [
-            "Dividend Yield %", "Payout Ratio", "ROA", "ROE",
-            "Oper Margin", "Profit Margin", "WACC", "ROIC", "EVA"
-        ]
-        for col in porcentajes:
-            if col in df.columns:
-                df[col] = df[col].apply(lambda x: f"{x:.2%}" if pd.notnull(x) else "N/D")
-
-        columnas_mostrar = [
-            "Ticker", "Nombre", "Sector", "Precio", "P/E", "P/B", "P/FCF",
-            "Dividend Yield %", "Payout Ratio", "ROA", "ROE", "Current Ratio",
-            "Debt/Eq", "Oper Margin", "Profit Margin", "WACC", "ROIC", "EVA"
-        ]
-        st.dataframe(
-            df[columnas_mostrar].dropna(how="all", axis=1),
-            use_container_width=True,
-            height=400
-        )
+        show_cols = ["Ticker", "Sector", "Precio", "P/E", "P/B", "P/FCF",
+                     "Dividend Yield %", "Payout Ratio", "ROA", "ROE",
+                     "Current Ratio", "Debt/Eq", "Oper Margin", "Profit Margin",
+                     "WACC", "ROIC", "EVA"]
+        st.dataframe(df[show_cols].dropna(how="all", axis=1),
+                     use_container_width=True, height=400)
 
         # -----------------------------------------------------
         # Sección 2 - Análisis de Valoración
